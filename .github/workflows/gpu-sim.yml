@@ -1,0 +1,82 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the HIP backend (GPUFOAM_BACKEND_AMD=1 with the gfx90a rule in ./hipcc) and
+# runs the [GPU] cases of Test-gpuChemistry on a simulated AMD MI250X
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+#
+# niemiti/ofdevcuda is Ubuntu 20.04, which has no ROCm 7 packages, so the job
+# runs on the Ubuntu 24.04 runner and copies the prebuilt OpenFOAM-dev out of
+# that image. The image is pinned by digest to the build the "Compile and test"
+# workflow last passed with (2026-09-03); the current latest tag has a newer
+# OpenFOAM-dev that gpuFoam does not compile against yet.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - "gpu_chemistry/**"
+      - "gpu_utils/**"
+      - "hipcc"
+      - "Allwmake"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  OPENFOAM_IMAGE: niemiti/ofdevcuda@sha256:091b666288b1da8d7cfc633f28d9cd2abf5ba6fe5998aff42c3c38ffdbb5b762
+
+jobs:
+  hip-tests:
+    name: HIP GPU tests (ROCm 7.1 and simulated MI250X)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/setup-pantheonsim@ab71a07326835be678918901c340d53a83358067 # v0.1.6
+        with:
+          gpu: amd/mi250x
+          cuda-toolkit: none
+          rocm: "7.1"
+
+      # variant.hpp includes <thrust/memory.h>. rocThrust and rocPRIM are
+      # header-only; they are unpacked rather than installed because their
+      # packages depend on the real HIP runtime, which would replace the
+      # simulator's.
+      - name: Add rocThrust and rocPRIM headers
+        run: |
+          cd "$RUNNER_TEMP"
+          apt-get download rocthrust-dev rocprim-dev
+          for d in rocthrust-dev*.deb rocprim-dev*.deb; do sudo dpkg-deb -x "$d" /; done
+          rm -f rocthrust-dev*.deb rocprim-dev*.deb
+
+      - name: Copy OpenFOAM-dev out of niemiti/ofdevcuda
+        run: |
+          docker run --rm --user root -v /opt:/out "$OPENFOAM_IMAGE" cp -a /opt/OpenFOAM /out/
+          sudo apt-get install -y -qq --no-install-recommends libopenmpi-dev
+
+      - name: Build gpuFoam (HIP backend)
+        shell: bash
+        run: |
+          source /opt/OpenFOAM/OpenFOAM-dev/etc/bashrc || true
+          export GPUFOAM_BACKEND_AMD=1 WM_NCOMPPROCS=3
+          ./Allwmake
+
+      - name: GPU unit tests
+        shell: bash
+        run: |
+          source /opt/OpenFOAM/OpenFOAM-dev/etc/bashrc || true
+          vgpu run "$FOAM_USER_APPBIN/Test-gpuChemistry" "[GPU]"
